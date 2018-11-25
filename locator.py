@@ -21,6 +21,7 @@ import subprocess
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from collections import namedtuple
 
 
 def get_arguments():
@@ -37,10 +38,14 @@ def get_arguments():
     parser.add_argument("--prefix", type = str, required = False, default = "BLAST", help = "A prefix for output files")
     
     # environmental settings
+    parser.add_argument("--makeblastdb", default = "makeblastdb", required = False, help = "Path to call makeblastdb")
     parser.add_argument("--blast", default = "blastn", required = False, help = "Path to call BLAST")
     parser.add_argument("--algorithm", default = "megablast", required = False, help = "BLAST algorithm (the -task argument)")
     parser.add_argument("--cdhit", default = "cd-hit-est", required = False, help = "Path to call CD-HIT-EST")
     parser.add_argument("--cdhit_args", default = "", required = False, help = "A string of arguments for CD-HIT-EST")
+    
+    # output control
+    parser.add_argument("--skip", action = "store_true", required = False, help = "Flag it to skip existing output files")
     
     return parser.parse_args()
 
@@ -50,16 +55,70 @@ def main():
     subdirs = make_output_dirs(args.outdir)
     cls = read_cluster_contents(args.clusters)
     queries = extract_allele_seqs(cluster_contents = cls, db = args.allele_db, outdir = subdirs["allele"],\
-                                  prefix = args.prefix)
-    assemblies = makeblastdb(args.assemblies, subdirs["database"])
+                                  prefix = args.prefix, skip = args.skip)
+    assemblies = makeblastdb(prog = args.makeblastdb, assemblies = args.assemblies, db_dir = subdirs["database"],\
+                             suffix = args.suffix, skip = args.skip)
+    hits = blast(prog = args.blast, task = args.algorithm, queries = queries, dbs = assemblies,\
+                 outdir = subdirs["blast"], prefix = args.prefix, skip = args.skip)
     
 
-def makeblastdb(assemblies, db_dir):
+def blast(prog, task, queries, dbs, outdir, prefix, skip):
+    print("Search allele clusters in contigs.")
+    header = "qseqid sseqid sstart send pident qlen length bitscore"
+    blast_outputs = {}
+    n = 0
+    for cid, query_fasta in queries.items():
+        for sample, assembly in dbs.items():
+            if prefix != "":
+                output_file = os.path.join(outdir, "%s__%s__%s.tsv" % (prefix, cid, sample))
+            else:
+                output_file = os.path.join(outdir, "%s__%s.tsv" % (cid, sample))
+            if not (os.path.exists(output_file) and skip):
+                cmd = [prog, "-task", task, "-db", assembly.blast_db, "-query", query_fasta,\
+                       "-outfmt", "6 " + header]
+                process = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+                out, err = process.communicate()
+                out = out.decode()
+                err = err.decode()
+                if len(err) > 0:
+                    print("* Error: sequence search for cluster %s failed for the sample %s:" % (cid, sample),\
+                          file = sys.stderr)
+                    print(err, file = sys.stderr)
+                    quit()
+                with open(output_file, "w") as f:
+                    f.write(out)
+                n += 1
+            blast_outputs[sample] = output_file
+    print("* %i BLAST jobs are implemented." % n)
+    print("* Header of every output file: " + header)
+    
+    return blast_outputs
+
+
+def makeblastdb(prog, assemblies, db_dir, suffix, skip):
     print("Creating BLAST database from every assembly file.")
-    return
+    Assembly = namedtuple("Assembly", ["fasta", "blast_db"])
+    dbs = {}  # a dictionary of namedtuples
+    n = 0
+    for a in assemblies:
+        a_base = os.path.basename(a)
+        sample = a_base.rstrip(suffix)
+        new_db = os.path.join(db_dir, sample)
+        dbs[sample] = Assembly(fasta = a, blast_db = new_db)
+        if not (os.path.exists(new_db + ".nhr") and os.path.exists(new_db + ".nin") and os.path.exists(new_db + ".nsq") and skip):
+            cmd = [prog, "-in", a, "-dbtype", "nucl", "-out", new_db]
+            try:
+                subprocess.check_call(cmd)
+            except subprocess.CalledProcessError:
+                print("Runtime error: cannot make BLAST database for sample %s." % sample)
+                raise
+        n += 1
+    print("* Totally %i BLAST databases are created (or already exist)." % n)
+    
+    return dbs
 
 
-def extract_allele_seqs(cluster_contents, db, outdir, prefix):
+def extract_allele_seqs(cluster_contents, db, outdir, prefix, skip):
     # Create a FASTA file for each cluster to store their allele sequences
     print("Extract allele sequences of each cluster.")
     allele_db = list(SeqIO.parse(db, "fasta"))  # import the allele database
@@ -67,23 +126,24 @@ def extract_allele_seqs(cluster_contents, db, outdir, prefix):
     file_count = 0
     for cid, alleles in cluster_contents.items():
         if prefix != "":
-            out_fasta = os.path.join(outdir, "__".join([prefix, cid, "alleles.fasta"]))
+            out_fasta = os.path.join(outdir, "__".join([prefix, cid, "alleles.fna"]))
         else:
-            out_fasta = os.path.join(outdir, cid + "__alleles.fasta")
+            out_fasta = os.path.join(outdir, cid + "__alleles.fna")
         queries[cid] = out_fasta
-        out_handle = open(out_fasta, "w")  # create a new file or override an existing file
-        alleles = alleles.split(",")
-        sum_alleles = len(alleles)
-        allele_count = 0
-        for rec in allele_db:
-            if rec.id in alleles:
-                SeqIO.write(rec, out_handle, "fasta")
-                allele_count += 1
-        out_handle.close()
+        if not (os.path.exists(out_fasta) and skip):
+            out_handle = open(out_fasta, "w")  # create a new file or override an existing file
+            alleles = alleles.split(",")
+            sum_alleles = len(alleles)
+            allele_count = 0
+            for rec in allele_db:
+                if rec.id in alleles:
+                    SeqIO.write(rec, out_handle, "fasta")
+                    allele_count += 1
+            out_handle.close()
+            if allele_count < sum_alleles:
+                print("* Warning: not all alleles of cluster %s are found in the allele database." % cid)
         file_count += 1
-        if allele_count < sum_alleles:
-            print("* Warning: not all alleles of cluster %s are found in the allele database." % cid)
-    print("* Totally %i FASTA files are generated." % file_count)
+    print("* Totally %i FASTA files are generated (or already exist)." % file_count)
     
     return queries
 
