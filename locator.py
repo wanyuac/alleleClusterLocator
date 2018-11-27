@@ -25,6 +25,10 @@ from Bio.Alphabet import generic_dna
 from collections import namedtuple, defaultdict
 
 
+# Public data types
+Path = namedtuple("Path", ["contig", "start", "end", "length"])  # the shortest path embedding all alleles in a contig; length = end - start + 1
+
+
 def get_arguments():
     parser = argparse.ArgumentParser(description = "Searching allele clusters in contigs")
     
@@ -228,9 +232,7 @@ def check_singularity(cn, contig_name, cid, sample):
 
 
 def find_shortest_path_single_copy(alleles, contig_name):
-    # A subordinate function of get_shortest_path_per_contig
-    Path = namedtuple("Path", ["contig", "start", "end", "length"])  # the shortest path embedding all alleles in a contig; length = end - start + 1
-    
+    # A subordinate function of get_shortest_path_per_contig    
     low_coords = []
     high_coords = []
     for allele_name, coordinate_list in alleles.items():
@@ -252,11 +254,31 @@ def find_shortest_path_single_copy(alleles, contig_name):
 
 
 def find_shortest_path_multi_copy(cn, alleles, contig_name):
-    Path = namedtuple("Path", ["contig", "start", "end", "length"])
-    
+    perms = permutation_generator(cn)
+    region_lengths = []  # to store lengths of all possible regions so that we can find out the shortest one
+    for pm in perms:  # pm is a list of integers
+        
     p = Path(contig = contig_name, start = low, end = high, length = high - low + 1)
 
     return p
+
+
+def permutation_generator(ns):
+    """
+    An elegant generator of permutations of m steps, for which the i-th step has n_i choices. Therefore,
+    this function returns a list of n_1 * n_2 * ... * n_m elements for all permutations.
+    """
+    perms = []
+    if len(ns) > 1:
+        perms_stack = permutation_generator(ns[1 : ])  # permutations from the stack of steps
+        for i in list(range(0, ns[0])):
+            for j in perms_stack:  # j is a list in perms_prev
+                perms.append([i] + j)  # [[1, 2, 3, ...], [2, 5, 3, ...], ...], where each element list represents a permutation
+    else:  # The function reaches the bottom of the stack, when there is only one element in the list ns.
+        for i in list(range(0, ns[0])):
+            perms.append([i])  # produces [[0], [1], [2], ..., [ns[0]]]
+    
+    return perms
 
 
 def concatenate_blast_output(hits, prefix, outdir, skip, clean):
