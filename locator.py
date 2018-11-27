@@ -110,7 +110,7 @@ def extract_cluster_seq(paths, assemblies, outdir, prefix):
 def find_shortest_paths(hits, cluster_contents, outdir, prefix, skip):
     # Assume all hits are exact to corresponding alleles.
     print("Find the shortest path embedding all alleles per cluster in each contig.")
-    Path = namedtuple("Path", ["contig", "start", "end", "length"])
+    Path = namedtuple("Path", ["contig", "start", "end", "length"])  # the final output of this function
     paths = defaultdict(dict)  # {cid : {sample : [Path(contig, start, end), ...]}}
     if prefix != "":
         out_file = os.path.join(outdir, prefix + "__paths.tsv")
@@ -130,17 +130,28 @@ def find_shortest_paths(hits, cluster_contents, outdir, prefix, skip):
             else:
                 paths[cid][sample].append(Path(contig = contig, start = int(start), end = int(end), length = int(length)))
         f.close()
-    else:
+    else:  # for new runs
         print("* Determine and save shortest paths to file %s." % out_file)
         f = open(out_file, "w")
+        
+        # Run path determination for each cluster and each sample.
         for cid, hits_dict in hits.items():
             cluster_size = len(cluster_contents[cid])  # number of alleles per cluster
             for sample, hit_list in hits_dict.items():
                 if len(hit_list) >= cluster_size:  # The number of hits must not be smaller than the number of alleles of the current cluster.
-                    contigs = get_hits_in_contigs(hit_list)  # for the current cluster and sample
-                    for contig, alleles in contigs.items():  # alleles: {allele : Allele(start = [...], end = [...])}
-                        if len(list(alleles.keys())) == cluster_size:  # len(alleles.keys()) < cluster_size when the current contig does not harbour all the alleles
-                            new_path = get_shortest_path_per_contig(contig, alleles, cid, sample)
+                    contigs = get_hits_in_contigs(hit_list)  # a two-dimensional dictionary for the current cluster and sample
+                    for contig, allele_dict in contigs.items():  # alleles: {allele : Allele(start = [...], end = [...])}
+                        """
+                        Below, I show the only condition that starts the procedure of looking for the shortest path per contig.
+                        len(allele_dict.keys()) < cluster_size when the current contig does not harbour all the alleles.
+                        get_shortest_path_per_contig is the most sophisticated and perhaps the slowest function of this script.
+                        """
+                        if len(list(allele_dict.keys())) == cluster_size:
+                            new_path = get_shortest_path_per_contig(contig_name = contig, alleles = allele_dict,\
+                                                                    cluster_size = cluster_size, cid = cid,\
+                                                                    sample = sample)
+                            
+                            # Store the identified path into a two-dimensional dictionary.
                             if cid not in list(paths.keys()):
                                 paths[cid] = {sample : [new_path]}
                             elif sample not in list(paths[cid].keys()):
@@ -155,38 +166,77 @@ def find_shortest_paths(hits, cluster_contents, outdir, prefix, skip):
 
 
 def get_hits_in_contigs(hit_list):
-    # This is the first subordinate function of get_shortest_paths.
-    Allele = namedtuple("Allele", ["start", "end"])  # Attributes "start" and "end" are lists.
-    contigs = defaultdict(dict)  # {contig name : {allele : Allele(start = [...], end = [...])}}
+    """
+    This is the first subordinate function of get_shortest_paths. The data structure of contigs can be displayed as:
+    contig name -- level-1 key
+        allele  -- level-2 key
+            [(start1, end1)
+            (start2, end2)
+            ...] -- a list of namedtuples
+    """
+    Allele_coords = namedtuple("Allele_coords", ["start", "end"])  # Attributes "start" and "end" are lists.
+    contigs = defaultdict(dict)  # {contig name : {allele : [Allele_coords(start, end), Allele_coords(start, end), ...]}}
     for h in hit_list:
         if h.contig not in list(contigs.keys()):
-            contigs[h.contig] = {h.allele : Allele(start = [h.start], end = [h.end])}
+            contigs[h.contig] = {h.allele : [Allele_coords(start = h.start, end = h.end)]}
         elif h.allele not in list(contigs[h.contig].keys()):
-            contigs[h.contig][h.allele] = Allele(start = [h.start], end = [h.end])
+            contigs[h.contig][h.allele] = [Allele_coords(start = h.start, end = h.end)]
         else:  # Another copy of a known allele is found.
-            contigs[h.contig][h.allele].start.append(h.start)
-            contigs[h.contig][h.allele].end.append(h.end)
+            contigs[h.contig][h.allele].append(Allele_coords(start = h.start, end = h.end))  # append a new tuple into the list
     
     return contigs
 
 
-def get_shortest_path_per_contig(contig_name, alleles, cid, sample):
+def get_shortest_path_per_contig(contig_name, alleles, cluster_size, cid, sample):
     """
     This is the second subordinate function of get_shortest_paths. It returns a Path object.
-    alleles: {allele : Allele(start = [...], end = [...])}.
-    Currently, this function can only handle the scenario where there is only a single copy per
-    allele in a contig.
+    alleles: {allele : [Allele(start, end), Allele(start, end), ...]}. This function addresses the challenge in determining the
+    shortest path when one or more alleles having multiple exact copies in the same contig.
     """
+    cn = count_copy_numbers(alleles)  # returns a namedtuple of copy numbers for alleles in the current contig
+    only_single_copies = check_singularity(cn, contig_name, cid, sample)  # returns a boolean value showing whether there is only a single copy per allele
+    if only_single_copies:
+        p = find_shortest_path_single_copy(alleles, contig_name)
+    else:
+        p = find_shortest_path_multi_copy(cn, alleles, contig_name)
+        
+    return p
+
+
+def count_copy_numbers(allele_dict):
+    # A subordinate function of get_shortest_path_per_contig, and it counts the number of copies per allele.
+    CN = namedtuple("CN", ["alleles", "copies"])
+    cn = CN(alleles = [], counts = [])
+    for allele_name, coordinate_list in allele_dict.items():
+        cn.alleles.append(allele_name)  # [allele1, allele2, allele3, ...]
+        cn.copies.append(len(coordinate_list))  # [2, 1, 3, ...]
+    
+    return cn
+
+
+def check_singularity(cn, contig_name, cid, sample):
+    # Determine whether there is only a single copy per allele
+    is_singular = True
+    for i in list(range(0, len(cn.alleles))):
+        n = cn.copies[i] 
+        if n > 1:
+            print("* Notice: allele %s of the cluster %s in the contig %s of sample %s has %i copies." %\
+                  (cn.alleles[i], cid, contig_name, sample, n))
+            is_singular = False  # change the Boolean value forever
+    
+    return is_singular
+
+
+def find_shortest_path_single_copy(alleles, contig_name):
+    # A subordinate function of get_shortest_path_per_contig
     Path = namedtuple("Path", ["contig", "start", "end", "length"])  # the shortest path embedding all alleles in a contig; length = end - start + 1
+    
     low_coords = []
     high_coords = []
-    for allele_name, coords in alleles.items():
-        coords_len = len(coords.start)
-        if coords_len > 1:
-            print("* Warning: allele %s of cluster %s has more than one copy in contig %s of sample %s. " % (allele_name,\
-            cid, contig_name, sample))
-        s = coords.start[0]
-        e = coords.end[0]
+    for allele_name, coordinate_list in alleles.items():
+        c = coordinate_list[0]  # There must be only one element in the list.
+        s = c.start
+        e = c.end
         if s > e:  # in complementary orientaion
             low_coords.append(e)
             high_coords.append(s)
@@ -196,7 +246,17 @@ def get_shortest_path_per_contig(contig_name, alleles, cid, sample):
         low = min(low_coords)
         high = max(high_coords)
         
-    return Path(contig = contig_name, start = low, end = high, length = high - low + 1)
+    p = Path(contig = contig_name, start = low, end = high, length = high - low + 1)
+        
+    return p
+
+
+def find_shortest_path_multi_copy(cn, alleles, contig_name):
+    Path = namedtuple("Path", ["contig", "start", "end", "length"])
+    
+    p = Path(contig = contig_name, start = low, end = high, length = high - low + 1)
+
+    return p
 
 
 def concatenate_blast_output(hits, prefix, outdir, skip, clean):
