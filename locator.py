@@ -71,6 +71,48 @@ def main():
     paths = find_shortest_paths(hits = exact_hits, cluster_contents = cls, outdir = subdirs["region"],\
                                 prefix = args.prefix, skip = args.skip)  # assuming there is only a single copy per allele in a contig
     region_dirs = extract_cluster_seq(paths, assemblies, subdirs["region"], args.prefix)
+
+
+def make_output_dirs(outdir):
+    # Create output directories
+    print("Check output directories.")
+    subdirs = {"allele" : os.path.join(outdir, "Allele"),
+               "database" : os.path.join(outdir, "Database"),
+               "blast" : os.path.join(outdir, "BLAST"),
+               "region" : os.path.join(outdir, "Region"),
+               "cluster" : os.path.join(outdir, "Cluster")}
+    check_dir(outdir)
+    for d in list(subdirs.values()):
+        check_dir(d)
+    
+    return subdirs
+
+
+def check_dir(d):
+    # This is a subordinate function of make_output_dirs and extract_cluster_seq.
+    if not os.path.exists(d):
+        try:
+            subprocess.check_call(["mkdir", d])  # stay compatible with older Python versions, although subprocess.run is available for Python 3.5+.
+        except subprocess.CalledProcessError:
+            print("* Error: the target directory cannot be created.")
+            raise
+    
+    return
+
+
+def read_cluster_contents(cluster_def):
+    # cluster_def is the path to a tab-delimited file, which must not have a header line.
+    print("Read cluster contents.")
+    cls = {}
+    with open(cluster_def) as f:
+        lines = f.read().splitlines()
+    for c in lines:
+        cid, alleles = c.split("\t")
+        alleles = alleles.split(",")
+        cls[cid] = alleles
+    print("* Totally %i clusters are defined." % len(cls))
+    
+    return cls
     
 
 def extract_cluster_seq(paths, assemblies, outdir, prefix):
@@ -109,7 +151,166 @@ def extract_cluster_seq(paths, assemblies, outdir, prefix):
             f_out_handle.close()
     
     return dirs
+
+
+def makeblastdb(prog, assemblies, db_dir, suffix, skip):
+    print("Creating BLAST database from every assembly file.")
+    Assembly = namedtuple("Assembly", ["fasta", "blast_db"])
+    dbs = {}  # a dictionary of namedtuples
+    n = 0
+    for a in assemblies:
+        a_base = os.path.basename(a)
+        sample = a_base.rstrip(suffix)
+        new_db = os.path.join(db_dir, sample)
+        dbs[sample] = Assembly(fasta = a, blast_db = new_db)
+        if not (os.path.exists(new_db + ".nhr") and os.path.exists(new_db + ".nin") and os.path.exists(new_db + ".nsq") and skip):
+            cmd = [prog, "-in", a, "-dbtype", "nucl", "-out", new_db]
+            try:
+                subprocess.check_call(cmd)
+            except subprocess.CalledProcessError:
+                print("Runtime error: cannot make BLAST database for sample %s." % sample)
+                raise
+        n += 1
+    print("* Totally %i BLAST databases are created (or already exist)." % n)
     
+    return dbs
+
+
+def blast(prog, task, queries, dbs, outdir, prefix, skip):
+    print("Search allele clusters in contigs.")
+    header = "qseqid sseqid sstart send pident qlen length gaps"
+    blast_outputs = {}
+    hit_num = 0
+    nohit_num = 0
+    n = 0
+    
+    if prefix != "":
+        success_mark = os.path.join(outdir, "__".join([prefix, "blast.success"]))
+    else:
+        success_mark = os.path.join(outdir, "blast.success")
+    
+    for cid, query_fasta in queries.items():
+        for sample, assembly in dbs.items():
+            # Set output filename
+            if prefix != "":
+                output_file = os.path.join(outdir, "%s__%s__%s.txt" % (prefix, cid, sample))
+            else:
+                output_file = os.path.join(outdir, "%s__%s.txt" % (cid, sample))
+                
+            # Run BLAST
+            if os.path.exists(output_file) and skip:  # only record the output filename
+                if sample in list(blast_outputs.keys()):
+                    blast_outputs[sample].append(output_file)
+                else:
+                    blast_outputs[sample] = [output_file]
+            elif (not os.path.exists(success_mark)) or (not skip):  # Do nothing else.
+                cmd = [prog, "-task", task, "-db", assembly.blast_db, "-query", query_fasta,\
+                       "-outfmt", "6 " + header]
+                process = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+                out, err = process.communicate()
+                out = out.decode()
+                err = err.decode()
+                n += 1  # job count + 1
+                if len(err) > 0:
+                    print("* Error: sequence search for cluster %s failed for the sample %s:" % (cid, sample),\
+                          file = sys.stderr)
+                    print(err, file = sys.stderr)
+                    quit()
+                if len(out) > 0:
+                    hit_num += 1
+                    with open(output_file, "w") as f:
+                        f.write(out)
+                    if sample in list(blast_outputs.keys()):
+                        blast_outputs[sample].append(output_file)
+                    else:
+                        blast_outputs[sample] = [output_file]
+                else:
+                    nohit_num += 1  # Do not record the output filename as the file does not exist.
+                    print("No hit of cluster %s in sample %s." % (cid, sample))
+    subprocess.call(["touch", success_mark])
+                
+    print("* There are %i BLAST jobs launched, %i returned hits and %i did not have any hits." % (n, hit_num, nohit_num))
+    print("* Header of every output file: " + header)
+    
+    return blast_outputs
+
+
+def concatenate_blast_output(hits, prefix, outdir, skip, clean):
+    """
+    Concatenate BLAST outputs into a TSV file and delete the original outputs (*.txt).
+    This function only keeps exact hits of alleles.
+    """
+    print("Parse and concatenate BLAST outputs.")
+    Hit = namedtuple("Hit", ["allele", "contig", "start", "end", "identity", "allele_len", "hit_len", "gap_num"])
+    hits_conc = defaultdict(dict)  # {cluster id : {sample : [Hit1, Hit2, ...]}}
+    with_prefix = prefix != ""
+    if with_prefix:
+        f_out = os.path.join(outdir, prefix + "__BLAST.tsv")
+    else:
+        f_out = os.path.join(outdir, "BLAST.tsv")
+    
+    if os.path.exists(f_out) and skip:
+        # Scenario 1: directly read outputs from a previous run.
+        print("* Read %s for exact hits of alleles." % f_out)
+        f = open(f_out, "rU")
+        lines = f.read().splitlines()
+        n = 0
+        for h in lines:
+            cid, sample, allele, contig, start, end, identity, allele_len, hit_len, gap_num = h.split("\t")
+            hit = Hit(allele = allele, contig = contig, start = int(start), end = int(end), identity = float(identity),\
+                      allele_len = int(allele_len), hit_len = int(hit_len), gap_num = int(gap_num))
+            if cid not in list(hits_conc.keys()):
+                hits_conc[cid] = {sample : [hit]}
+            elif sample not in list(hits_conc[cid].keys()):
+                hits_conc[cid][sample] = [hit]
+            else:
+                hits_conc[cid][sample].append(hit)
+            n += 1
+        print("* %i hits have been imported." % n)
+        f.close()
+    else:
+        # Scenario 2: compile BLAST outputs
+        for sample, out_files in hits.items():
+            for out_f in out_files:
+                if with_prefix:
+                    _, cid, _ = out_f.split("__")
+                else:
+                    cid, _ = out_f.split("__")
+            
+                # Parse a single output file
+                with open(out_f, "rU") as f_blast:
+                    lines = f_blast.read().splitlines()
+                for h in lines:
+                    qseqid, sseqid, sstart, send, pident, qlen, length, gaps = h.split("\t")
+                    hit = Hit(allele = qseqid, contig = sseqid, start = int(sstart), end = int(send),\
+                              identity = float(pident), allele_len = int(qlen), hit_len = int(length),\
+                              gap_num = int(gaps))  # a hit of an allele in the current cluster in the current sample
+                    if hit.identity == 100 and hit.gap_num == 0 and hit.allele_len == hit.hit_len:
+                        # Add this hit into the dictionary; else, discard.
+                        if cid not in list(hits_conc.keys()):
+                            hits_conc[cid] = {sample : [hit]}
+                        elif sample not in list(hits_conc[cid].keys()):
+                            hits_conc[cid][sample] = [hit]
+                        else:
+                            hits_conc[cid][sample].append(hit)
+        
+        # Write concatenated BLAST hits into a file
+        print("Print exact hits of alleles.")
+        f = open(f_out, "w")
+        for cid, hits_dict in hits_conc.items():
+            for sample, hit_list in hits_dict.items():
+                for h in hit_list:
+                    f.write("\t".join([cid, sample, h.allele, h.contig, str(h.start), str(h.end), str(h.identity),\
+                                       str(h.allele_len), str(h.hit_len), str(h.gap_num)]) + "\n")
+        f.close()
+                
+    # Finally, delete all *.txt files
+    if clean:
+        print("Delete original BLAST outputs.")
+        subprocess.call(["rm", os.path.join(outdir, "*.txt")])
+    
+    return hits_conc
+
     
 def find_shortest_paths(hits, cluster_contents, outdir, prefix, skip):
     # Assume all hits are exact to corresponding alleles.
@@ -235,7 +436,7 @@ def find_shortest_path_single_copy(alleles, contig_name):
     # A subordinate function of get_shortest_path_per_contig    
     low_coords = []
     high_coords = []
-    for allele_name, coordinate_list in alleles.items():
+    for coordinate_list in list(alleles.values()):
         c = coordinate_list[0]  # There must be only one element in the list.
         s = c.start
         e = c.end
@@ -245,9 +446,8 @@ def find_shortest_path_single_copy(alleles, contig_name):
         else:
             low_coords.append(s)
             high_coords.append(e)
-        low = min(low_coords)
-        high = max(high_coords)
-        
+    low = min(low_coords)
+    high = max(high_coords)
     p = Path(contig = contig_name, start = low, end = high, length = high - low + 1)
         
     return p
@@ -256,9 +456,23 @@ def find_shortest_path_single_copy(alleles, contig_name):
 def find_shortest_path_multi_copy(cn, alleles, contig_name):
     perms = permutation_generator(cn)
     region_lengths = []  # to store lengths of all possible regions so that we can find out the shortest one
-    for pm in perms:  # pm is a list of integers
-        
-    p = Path(contig = contig_name, start = low, end = high, length = high - low + 1)
+    regions = []  # a list of Path objects for all possible regions
+    p = None  # initial value
+    for pm in perms:  # pm is a list of indices specifying which copy of each allele will be used for calculating the region length.
+        regions.append(calc_region_length(indices = pm, copy_numbers = cn, allele_dict = alleles))
+    
+    # Find out the shortest length
+    n = len(regions)
+    for i in list(range(0, n)):
+        region_lengths.append(regions[i].length)
+    len_min = min(region_lengths)
+    
+    # Determine which region has the shortest length
+    for i in list(range(0, n)):
+        r = regions[i]
+        if r.length == len_min:  # only take the first region when there is a tie
+            p = Path(contig = contig_name, start = r.low, end = r.high, length = len_min)
+            break
 
     return p
 
@@ -266,7 +480,9 @@ def find_shortest_path_multi_copy(cn, alleles, contig_name):
 def permutation_generator(ns):
     """
     An elegant generator of permutations of m steps, for which the i-th step has n_i choices. Therefore,
-    this function returns a list of n_1 * n_2 * ... * n_m elements for all permutations.
+    this function returns a list of n_1 * n_2 * ... * n_m elements for all permutations. Assuming there
+    are alleles [a1, a2, a3, ...] in an array, then perms = [i1, i2, i3, ...] for indices of copies of
+    these alleles.
     """
     perms = []
     if len(ns) > 1:
@@ -281,163 +497,32 @@ def permutation_generator(ns):
     return perms
 
 
-def concatenate_blast_output(hits, prefix, outdir, skip, clean):
+def calc_region_length(indices, copy_numbers, allele_dict):
     """
-    Concatenate BLAST outputs into a TSV file and delete the original outputs (*.txt).
-    This function only keeps exact hits of alleles.
+    Calculate a region width given a list of copy indices of alleles
+    alleles: a dictionary; copy_numbers: a list of CN objects; indices: a list of indices following the same order
+    as the argument "alleles". In theory, find_shortest_path_single_copy can be replaced by this function. However,
+    the former is faster than the latter.
     """
-    print("Parse and concatenate BLAST outputs.")
-    Hit = namedtuple("Hit", ["allele", "contig", "start", "end", "identity", "allele_len", "hit_len", "gap_num"])
-    hits_conc = defaultdict(dict)  # {cluster id : {sample : [Hit1, Hit2, ...]}}
-    with_prefix = prefix != ""
-    if with_prefix:
-        f_out = os.path.join(outdir, prefix + "__BLAST.tsv")
-    else:
-        f_out = os.path.join(outdir, "BLAST.tsv")
-    
-    if os.path.exists(f_out) and skip:
-        # Scenario 1: directly read outputs from a previous run.
-        print("* Read %s for exact hits of alleles." % f_out)
-        f = open(f_out, "rU")
-        lines = f.read().splitlines()
-        n = 0
-        for h in lines:
-            cid, sample, allele, contig, start, end, identity, allele_len, hit_len, gap_num = h.split("\t")
-            hit = Hit(allele = allele, contig = contig, start = int(start), end = int(end), identity = float(identity),\
-                      allele_len = int(allele_len), hit_len = int(hit_len), gap_num = int(gap_num))
-            if cid not in list(hits_conc.keys()):
-                hits_conc[cid] = {sample : [hit]}
-            elif sample not in list(hits_conc[cid].keys()):
-                hits_conc[cid][sample] = [hit]
-            else:
-                hits_conc[cid][sample].append(hit)
-            n += 1
-        print("* %i hits have been imported." % n)
-        f.close()
-    else:
-        # Scenario 2: compile BLAST outputs
-        for sample, out_files in hits.items():
-            for out_f in out_files:
-                if with_prefix:
-                    _, cid, _ = out_f.split("__")
-                else:
-                    cid, _ = out_f.split("__")
-            
-                # Parse a single output file
-                with open(out_f, "rU") as f_blast:
-                    lines = f_blast.read().splitlines()
-                for h in lines:
-                    qseqid, sseqid, sstart, send, pident, qlen, length, gaps = h.split("\t")
-                    hit = Hit(allele = qseqid, contig = sseqid, start = int(sstart), end = int(send),\
-                              identity = float(pident), allele_len = int(qlen), hit_len = int(length),\
-                              gap_num = int(gaps))  # a hit of an allele in the current cluster in the current sample
-                    if hit.identity == 100 and hit.gap_num == 0 and hit.allele_len == hit.hit_len:
-                        # Add this hit into the dictionary; else, discard.
-                        if cid not in list(hits_conc.keys()):
-                            hits_conc[cid] = {sample : [hit]}
-                        elif sample not in list(hits_conc[cid].keys()):
-                            hits_conc[cid][sample] = [hit]
-                        else:
-                            hits_conc[cid][sample].append(hit)
-        
-        # Write concatenated BLAST hits into a file
-        print("Print exact hits of alleles.")
-        f = open(f_out, "w")
-        for cid, hits_dict in hits_conc.items():
-            for sample, hit_list in hits_dict.items():
-                for h in hit_list:
-                    f.write("\t".join([cid, sample, h.allele, h.contig, str(h.start), str(h.end), str(h.identity),\
-                                       str(h.allele_len), str(h.hit_len), str(h.gap_num)]) + "\n")
-        f.close()
-                
-    # Finally, delete all *.txt files
-    if clean:
-        print("Delete original BLAST outputs.")
-        subprocess.call(["rm", os.path.join(outdir, "*.txt")])
-    
-    return hits_conc
+    low_coords = []
+    high_coords = []
+    for i in list(range(0, len(indices))):
+        j = indices[i]  # the (j + 1)-th copy of the (i + 1)-th allele in copy_numbers.alleles
+        allele_name = copy_numbers.alleles[i]
+        pos = allele_dict[allele_name][j]  # take the (j + 1)-th copy of this allele
+        s = pos.start
+        e = pos.end
+        if s > e:  # in complementary orientaion
+            low_coords.append(e)
+            high_coords.append(s)
+        else:
+            low_coords.append(s)
+            high_coords.append(e)
+    low = min(low_coords)
+    high = max(high_coords)
+    region = Path(contig = None, start = low, end = high, length = high - low + 1)
 
-
-def blast(prog, task, queries, dbs, outdir, prefix, skip):
-    print("Search allele clusters in contigs.")
-    header = "qseqid sseqid sstart send pident qlen length gaps"
-    blast_outputs = {}
-    hit_num = 0
-    nohit_num = 0
-    n = 0
-    
-    if prefix != "":
-        success_mark = os.path.join(outdir, "__".join([prefix, "blast.success"]))
-    else:
-        success_mark = os.path.join(outdir, "blast.success")
-    
-    for cid, query_fasta in queries.items():
-        for sample, assembly in dbs.items():
-            # Set output filename
-            if prefix != "":
-                output_file = os.path.join(outdir, "%s__%s__%s.txt" % (prefix, cid, sample))
-            else:
-                output_file = os.path.join(outdir, "%s__%s.txt" % (cid, sample))
-                
-            # Run BLAST
-            if os.path.exists(output_file) and skip:  # only record the output filename
-                if sample in list(blast_outputs.keys()):
-                    blast_outputs[sample].append(output_file)
-                else:
-                    blast_outputs[sample] = [output_file]
-            elif (not os.path.exists(success_mark)) or (not skip):  # Do nothing else.
-                cmd = [prog, "-task", task, "-db", assembly.blast_db, "-query", query_fasta,\
-                       "-outfmt", "6 " + header]
-                process = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
-                out, err = process.communicate()
-                out = out.decode()
-                err = err.decode()
-                n += 1  # job count + 1
-                if len(err) > 0:
-                    print("* Error: sequence search for cluster %s failed for the sample %s:" % (cid, sample),\
-                          file = sys.stderr)
-                    print(err, file = sys.stderr)
-                    quit()
-                if len(out) > 0:
-                    hit_num += 1
-                    with open(output_file, "w") as f:
-                        f.write(out)
-                    if sample in list(blast_outputs.keys()):
-                        blast_outputs[sample].append(output_file)
-                    else:
-                        blast_outputs[sample] = [output_file]
-                else:
-                    nohit_num += 1  # Do not record the output filename as the file does not exist.
-                    print("No hit of cluster %s in sample %s." % (cid, sample))
-    subprocess.call(["touch", success_mark])
-                
-    print("* There are %i BLAST jobs launched, %i returned hits and %i did not have any hits." % (n, hit_num, nohit_num))
-    print("* Header of every output file: " + header)
-    
-    return blast_outputs
-
-
-def makeblastdb(prog, assemblies, db_dir, suffix, skip):
-    print("Creating BLAST database from every assembly file.")
-    Assembly = namedtuple("Assembly", ["fasta", "blast_db"])
-    dbs = {}  # a dictionary of namedtuples
-    n = 0
-    for a in assemblies:
-        a_base = os.path.basename(a)
-        sample = a_base.rstrip(suffix)
-        new_db = os.path.join(db_dir, sample)
-        dbs[sample] = Assembly(fasta = a, blast_db = new_db)
-        if not (os.path.exists(new_db + ".nhr") and os.path.exists(new_db + ".nin") and os.path.exists(new_db + ".nsq") and skip):
-            cmd = [prog, "-in", a, "-dbtype", "nucl", "-out", new_db]
-            try:
-                subprocess.check_call(cmd)
-            except subprocess.CalledProcessError:
-                print("Runtime error: cannot make BLAST database for sample %s." % sample)
-                raise
-        n += 1
-    print("* Totally %i BLAST databases are created (or already exist)." % n)
-    
-    return dbs
+    return region
 
 
 def extract_allele_seqs(cluster_contents, db, outdir, prefix, skip):
@@ -467,48 +552,6 @@ def extract_allele_seqs(cluster_contents, db, outdir, prefix, skip):
     print("* Totally %i FASTA files are generated (or already exist)." % file_count)
     
     return queries
-
-
-def make_output_dirs(outdir):
-    # Create output directories
-    print("Check output directories.")
-    subdirs = {"allele" : os.path.join(outdir, "Allele"),
-               "database" : os.path.join(outdir, "Database"),
-               "blast" : os.path.join(outdir, "BLAST"),
-               "region" : os.path.join(outdir, "Region"),
-               "cluster" : os.path.join(outdir, "Cluster")}
-    check_dir(outdir)
-    for d in list(subdirs.values()):
-        check_dir(d)
-    
-    return subdirs
-
-
-def check_dir(d):
-    # This is a subordinate function of make_output_dirs and extract_cluster_seq.
-    if not os.path.exists(d):
-        try:
-            subprocess.check_call(["mkdir", d])  # stay compatible with older Python versions, although subprocess.run is available for Python 3.5+.
-        except subprocess.CalledProcessError:
-            print("* Error: the target directory cannot be created.")
-            raise
-    
-    return
-
-
-def read_cluster_contents(cluster_def):
-    # cluster_def is the path to a tab-delimited file, which must not have a header line.
-    print("Read cluster contents.")
-    cls = {}
-    with open(cluster_def) as f:
-        lines = f.read().splitlines()
-    for c in lines:
-        cid, alleles = c.split("\t")
-        alleles = alleles.split(",")
-        cls[cid] = alleles
-    print("* Totally %i clusters are defined." % len(cls))
-    
-    return cls
 
 
 if __name__ == "__main__":
