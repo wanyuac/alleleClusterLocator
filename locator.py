@@ -4,11 +4,11 @@
 For each allele cluster, this script extracts the shortest genomic regions harbouring all the alleles from
 given genome assemblies (contigs) and cluster them using CD-HIT-EST.
 
-Python versions 2.7 and 3 compatible.
+Python versions 2 and 3 compatible.
 
 Copyright (C) 2018 Yu Wan <wanyuac@gmail.com>
 Licensed under the GNU General Public License, version 3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
-First version: 25 Nov 2018; the latest edition: 26 Nov 2018
+First version: 25 Nov 2018; the latest edition: 28 Nov 2018
 """
 
 from __future__ import print_function
@@ -70,7 +70,11 @@ def main():
                                           clean = args.clean)  # exact hits of alleles
     paths = find_shortest_paths(hits = exact_hits, cluster_contents = cls, outdir = subdirs["region"],\
                                 prefix = args.prefix, skip = args.skip)  # assuming there is only a single copy per allele in a contig
-    region_dirs = extract_cluster_seq(paths, assemblies, subdirs["region"], args.prefix)
+    region_dirs = extract_cluster_seq(paths = paths, assemblies = assemblies, outdir = subdirs["region"], prefix = args.prefix,\
+                                      skip = args.skip)
+    cluster_regions(region_dirs = region_dirs, cdhit_path = args.cdhit, cdhit_args = args.cdhit_args,\
+                    outdir = subdirs["cluster"], prefix = args.prefix, skip = args.skip)
+    print("The cluster localisation process has been run through successfully.")
 
 
 def make_output_dirs(outdir):
@@ -113,44 +117,35 @@ def read_cluster_contents(cluster_def):
     print("* Totally %i clusters are defined." % len(cls))
     
     return cls
-    
 
-def extract_cluster_seq(paths, assemblies, outdir, prefix):
-    # Create output directories
-    cids = list(paths.keys())
-    dirs = {}
-    for cid in cids:
-        d = os.path.join(outdir, cid)  # parental dir/Region/1, ...
-        check_dir(d)
-        dirs[cid] = d
-        
-    # Extract sequences of each cluster
-    for cid, samples in paths.items():
-        for sample, paths in samples.items():
-            if prefix != "":
-                f_out = os.path.join(dirs[cid], "%s__%s.fna" % (prefix, sample))
-            else:
-                f_out = os.path.join(dirs[cid], sample + ".fna")
-            fasta = assemblies[sample].fasta  # FASTA file of the original genome assembly
-            with open(fasta, "rU") as fasta_handle:
-                fasta_dict = SeqIO.to_dict(SeqIO.parse(fasta_handle, "fasta"))  # key: sequence ID; value: SeqRecord object.
-            f_out_handle = open(f_out, "w")
-            for p in paths:
-                contig = fasta_dict[p.contig]  # a SeqRecord object
-                contig_seq = str(contig.seq)
-                contig_seq = contig_seq[(p.start - 1) : p.end]
-                """
-                Do not change attributes of contig directly, as it will affect fasta_dict[p.contig]. It is better to create
-                a new record from contig. Further, there is no need to add an index to the sequence ID by far, as currently,
-                only one region is reported per contig by this script.
-                """
-                new_record = SeqRecord(Seq(contig_seq, generic_dna),\
-                                       id = contig.id + "|" + sample,\
-                                       description = ",".join([str(p.start), str(p.end), str(p.length)]))
-                SeqIO.write(new_record, f_out_handle, "fasta")
-            f_out_handle.close()
+
+def extract_allele_seqs(cluster_contents, db, outdir, prefix, skip):
+    # Create a FASTA file for each cluster to store their allele sequences
+    print("Extract allele sequences of each cluster.")
+    allele_db = list(SeqIO.parse(db, "fasta"))  # import the allele database
+    queries = {}
+    file_count = 0
+    for cid, alleles in cluster_contents.items():
+        if prefix != "":
+            out_fasta = os.path.join(outdir, "__".join([prefix, cid, "alleles.fna"]))
+        else:
+            out_fasta = os.path.join(outdir, cid + "__alleles.fna")
+        queries[cid] = out_fasta
+        if not (os.path.exists(out_fasta) and skip):
+            out_handle = open(out_fasta, "w")  # create a new file or override an existing file
+            sum_alleles = len(alleles)
+            allele_count = 0
+            for rec in allele_db:
+                if rec.id in alleles:
+                    SeqIO.write(rec, out_handle, "fasta")
+                    allele_count += 1
+            out_handle.close()
+            if allele_count < sum_alleles:
+                print("* Warning: not all alleles of cluster %s are found in the allele database." % cid)
+        file_count += 1
+    print("* Totally %i FASTA files are generated (or already exist)." % file_count)
     
-    return dirs
+    return queries
 
 
 def makeblastdb(prog, assemblies, db_dir, suffix, skip):
@@ -411,7 +406,7 @@ def get_shortest_path_per_contig(contig_name, alleles, cluster_size, cid, sample
 def count_copy_numbers(allele_dict):
     # A subordinate function of get_shortest_path_per_contig, and it counts the number of copies per allele.
     CN = namedtuple("CN", ["alleles", "copies"])
-    cn = CN(alleles = [], counts = [])
+    cn = CN(alleles = [], copies = [])
     for allele_name, coordinate_list in allele_dict.items():
         cn.alleles.append(allele_name)  # [allele1, allele2, allele3, ...]
         cn.copies.append(len(coordinate_list))  # [2, 1, 3, ...]
@@ -454,12 +449,12 @@ def find_shortest_path_single_copy(alleles, contig_name):
 
 
 def find_shortest_path_multi_copy(cn, alleles, contig_name):
-    perms = permutation_generator(cn)
+    perms = permutation_generator(cn.copies)
     region_lengths = []  # to store lengths of all possible regions so that we can find out the shortest one
     regions = []  # a list of Path objects for all possible regions
     p = None  # initial value
     for pm in perms:  # pm is a list of indices specifying which copy of each allele will be used for calculating the region length.
-        regions.append(calc_region_length(indices = pm, copy_numbers = cn, allele_dict = alleles))
+        regions.append(calc_region_length(indices = pm, allele_names = cn.alleles, allele_dict = alleles))
     
     # Find out the shortest length
     n = len(regions)
@@ -471,7 +466,7 @@ def find_shortest_path_multi_copy(cn, alleles, contig_name):
     for i in list(range(0, n)):
         r = regions[i]
         if r.length == len_min:  # only take the first region when there is a tie
-            p = Path(contig = contig_name, start = r.low, end = r.high, length = len_min)
+            p = Path(contig = contig_name, start = r.start, end = r.end, length = len_min)
             break
 
     return p
@@ -497,7 +492,7 @@ def permutation_generator(ns):
     return perms
 
 
-def calc_region_length(indices, copy_numbers, allele_dict):
+def calc_region_length(indices, allele_names, allele_dict):
     """
     Calculate a region width given a list of copy indices of alleles
     alleles: a dictionary; copy_numbers: a list of CN objects; indices: a list of indices following the same order
@@ -506,10 +501,10 @@ def calc_region_length(indices, copy_numbers, allele_dict):
     """
     low_coords = []
     high_coords = []
-    for i in list(range(0, len(indices))):
+    for i in list(range(0, len(indices))):  # len(indices): the number of alleles in the current contig
         j = indices[i]  # the (j + 1)-th copy of the (i + 1)-th allele in copy_numbers.alleles
-        allele_name = copy_numbers.alleles[i]
-        pos = allele_dict[allele_name][j]  # take the (j + 1)-th copy of this allele
+        a = allele_names[i]
+        pos = allele_dict[a][j]  # take the (j + 1)-th copy of this allele
         s = pos.start
         e = pos.end
         if s > e:  # in complementary orientaion
@@ -525,33 +520,81 @@ def calc_region_length(indices, copy_numbers, allele_dict):
     return region
 
 
-def extract_allele_seqs(cluster_contents, db, outdir, prefix, skip):
-    # Create a FASTA file for each cluster to store their allele sequences
-    print("Extract allele sequences of each cluster.")
-    allele_db = list(SeqIO.parse(db, "fasta"))  # import the allele database
-    queries = {}
-    file_count = 0
-    for cid, alleles in cluster_contents.items():
-        if prefix != "":
-            out_fasta = os.path.join(outdir, "__".join([prefix, cid, "alleles.fna"]))
-        else:
-            out_fasta = os.path.join(outdir, cid + "__alleles.fna")
-        queries[cid] = out_fasta
-        if not (os.path.exists(out_fasta) and skip):
-            out_handle = open(out_fasta, "w")  # create a new file or override an existing file
-            sum_alleles = len(alleles)
-            allele_count = 0
-            for rec in allele_db:
-                if rec.id in alleles:
-                    SeqIO.write(rec, out_handle, "fasta")
-                    allele_count += 1
-            out_handle.close()
-            if allele_count < sum_alleles:
-                print("* Warning: not all alleles of cluster %s are found in the allele database." % cid)
-        file_count += 1
-    print("* Totally %i FASTA files are generated (or already exist)." % file_count)
+def extract_cluster_seq(paths, assemblies, outdir, prefix, skip):
+    # Create output directories
+    cids = list(paths.keys())
+    dirs = {}  # {cid : directory path}
+    for cid in cids:
+        d = os.path.join(outdir, cid)  # parental dir/Region/1, ...
+        check_dir(d)
+        dirs[cid] = d
+        
+    # Extract sequences of each cluster
+    for cid, samples in paths.items():
+        for sample, paths in samples.items():
+            if prefix != "":
+                f_out = os.path.join(dirs[cid], "%s__%s.fna" % (prefix, sample))
+            else:
+                f_out = os.path.join(dirs[cid], sample + ".fna")
+            
+            if not (os.path.exists(f_out) and skip):
+                fasta = assemblies[sample].fasta  # FASTA file of the original genome assembly
+                with open(fasta, "rU") as fasta_handle:
+                    fasta_dict = SeqIO.to_dict(SeqIO.parse(fasta_handle, "fasta"))  # key: sequence ID; value: SeqRecord object.
+                f_out_handle = open(f_out, "w")
+                for p in paths:
+                    contig = fasta_dict[p.contig]  # a SeqRecord object
+                    contig_seq = str(contig.seq)
+                    contig_seq = contig_seq[(p.start - 1) : p.end]
+                    """
+                    Do not change attributes of contig directly, as it will affect fasta_dict[p.contig]. It is better to create
+                    a new record from contig. Further, there is no need to add an index to the sequence ID by far, as currently,
+                    only one region is reported per contig by this script. It is necessary to append the sample name to each
+                    sequence for the next step -- sequence clustering.
+                    """
+                    new_record = SeqRecord(Seq(contig_seq, generic_dna),\
+                                           id = contig.id + "|" + sample,\
+                                           description = ",".join([str(p.start), str(p.end), str(p.length)]))
+                    SeqIO.write(new_record, f_out_handle, "fasta")
+                f_out_handle.close()
     
-    return queries
+    return dirs
+
+
+def cluster_regions(region_dirs, cdhit_path, cdhit_args, outdir, prefix, skip):
+    if cdhit_path != "":
+        print("Perform clustering to extracted region sequences.")
+        for cid, seq_dir in list(region_dirs.items()):
+            print("* Concatenate FASTA files into a single temporary file for cluster %s." % cid)
+            
+            if prefix != "":
+                seq_files = os.path.join(seq_dir, "%s__*.fna" % prefix)  # Region/[cid]/[prefix]__*.fna
+                tmp_fasta = os.path.join(seq_dir, "%s__fasta.tmp" % prefix)
+                out_file = os.path.join(outdir, "%s__%s__clusters.fna" % (cid, prefix))
+                success_flag = os.path.join(outdir, "%s__%s__clustering.success" % (cid, prefix))
+            else:
+                seq_files = os.path.join(seq_dir, "*.fna")  # Region/[cid]/*.fna
+                tmp_fasta = os.path.join(seq_dir, "fasta.tmp")
+                out_file = os.path.join(outdir, cid + "__clusters.fna")
+                success_flag = os.path.join(outdir, cid + "__clustering.success")
+            
+            if os.path.exists(success_flag) and skip:
+                print("* Skip clustering for the cluster %s." % cid)
+            else:
+                proc = subprocess.Popen("cat %s > %s" % (seq_files, tmp_fasta), shell = True)  # Sample names have been attached to sequences previously.
+                proc.wait()  # wait until the command finishes
+                cmd = [cdhit_path, "-i", tmp_fasta, "-o", out_file] + cdhit_args.split(" ")
+                try:
+                    subprocess.check_call(cmd)
+                except subprocess.CalledProcessError:
+                    print("Command line '%s' failed." % " ".join(cmd))
+                    raise
+                subprocess.call(["rm", tmp_fasta])
+                subprocess.call(["touch", success_flag])
+    else:
+        print("Sequence cluster is skipped as CD-HIT-EST is not specified.")
+    
+    return
 
 
 if __name__ == "__main__":
