@@ -8,7 +8,7 @@ Python versions 2 and 3 compatible.
 
 Copyright (C) 2018 Yu Wan <wanyuac@gmail.com>
 Licensed under the GNU General Public License, version 3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
-First version: 25 Nov 2018; the latest edition: 28 Nov 2018
+First version: 25 Nov 2018; the latest edition: 28 Dec 2018
 """
 
 from __future__ import print_function
@@ -45,6 +45,7 @@ def get_arguments():
     # environmental settings
     parser.add_argument("--makeblastdb", default = "makeblastdb", required = False, help = "Path to call makeblastdb")
     parser.add_argument("--blast", default = "blastn", required = False, help = "Path to call BLAST")
+    parser.add_argument("--identity", type = int, required = False, default = 100, help = "The minimum nucleotide identity used for calling a hit.")
     parser.add_argument("--algorithm", default = "megablast", required = False, help = "BLAST algorithm (the -task argument)")
     parser.add_argument("--cdhit", default = "cd-hit-est", required = False, help = "Path to call CD-HIT-EST")
     parser.add_argument("--cdhit_args", default = "", required = False, help = "A string of arguments for CD-HIT-EST")
@@ -67,7 +68,7 @@ def main():
     hits = blast(prog = args.blast, task = args.algorithm, queries = queries, dbs = assemblies,\
                  outdir = subdirs["blast"], prefix = args.prefix, skip = args.skip)
     exact_hits = concatenate_blast_output(hits = hits, prefix = args.prefix, outdir = subdirs["blast"], skip = args.skip,\
-                                          clean = args.clean)  # exact hits of alleles
+                                          clean = args.clean, min_id = args.identity)  # exact hits of alleles
     paths = find_shortest_paths(hits = exact_hits, cluster_contents = cls, outdir = subdirs["region"],\
                                 prefix = args.prefix, skip = args.skip)  # assuming there is only a single copy per allele in a contig
     region_dirs = extract_cluster_seq(paths = paths, assemblies = assemblies, outdir = subdirs["region"], prefix = args.prefix,\
@@ -230,7 +231,7 @@ def blast(prog, task, queries, dbs, outdir, prefix, skip):
     return blast_outputs
 
 
-def concatenate_blast_output(hits, prefix, outdir, skip, clean):
+def concatenate_blast_output(hits, prefix, outdir, skip, clean, min_id):
     """
     Concatenate BLAST outputs into a TSV file and delete the original outputs (*.txt).
     This function only keeps exact hits of alleles.
@@ -280,7 +281,7 @@ def concatenate_blast_output(hits, prefix, outdir, skip, clean):
                     hit = Hit(allele = qseqid, contig = sseqid, start = int(sstart), end = int(send),\
                               identity = float(pident), allele_len = int(qlen), hit_len = int(length),\
                               gap_num = int(gaps))  # a hit of an allele in the current cluster in the current sample
-                    if hit.identity == 100 and hit.gap_num == 0 and hit.allele_len == hit.hit_len:
+                    if hit.identity >= min_id and hit.gap_num == 0 and hit.allele_len == hit.hit_len:
                         # Add this hit into the dictionary; else, discard.
                         if cid not in list(hits_conc.keys()):
                             hits_conc[cid] = {sample : [hit]}
