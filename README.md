@@ -6,7 +6,7 @@ Yu Wan
 
 
 
-This repository consists of a helper script (`acl.py`) of GeneMates and the script is developed for validation of interred horizontally co-transferred allele clusters. This Python script locates co-localised alleles in contigs of genome assemblies, extracts genomic regions that harbour all the alleles, and clusters sequences of these regions. More specifically, it carries out the following major steps:
+This repository consists of a helper script (`acl.py`) of R package [GeneMates](https://github.com/wanyuac/GeneMates) and the script is developed for validation of interred horizontally co-transferred allele clusters. This Python script locates co-localised alleles in contigs of genome assemblies, extracts genomic regions that harbour all the alleles, and clusters sequences of these regions. More specifically, it carries out the following major steps:
 
 1. Extracting allele sequences from a FASTA file in accordance with clusters defined in a TSV file.
 2. Searching for these allele sequences in several genome assemblies (FASTA format) using megaBLAST or BLASTn.
