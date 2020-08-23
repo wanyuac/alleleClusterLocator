@@ -8,14 +8,14 @@ Python versions 2 and 3 compatible.
 
 Copyright (C) 2018 Yu Wan <wanyuac@gmail.com>
 Licensed under the GNU General Public License, version 3 (https://www.gnu.org/licenses/gpl-3.0.en.html)
-First version: 25 Nov 2018; the latest edition: 28 Dec 2018
+First version: 25 Nov 2018; the latest edition: 23 Aug 2020
 """
 
 from __future__ import print_function
 from __future__ import division
 import os
 import sys
-sys.dont_write_bytecode = True
+sys.dont_write_bytecode = False  # Set True to disable generation of .pyc file
 import argparse
 import subprocess
 from Bio import SeqIO
@@ -106,7 +106,7 @@ def check_dir(d):
 
 
 def read_cluster_contents(cluster_def):
-    # cluster_def is the path to a tab-delimited file, which must not have a header line.
+    # Parameter cluster_def is the path to a tab-delimited file, which must not have a header line.
     print("Read cluster contents.")
     cls = {}
     with open(cluster_def) as f:
@@ -347,7 +347,7 @@ def find_shortest_paths(hits, cluster_contents, outdir, prefix, skip):
                         len(allele_dict.keys()) < cluster_size when the current contig does not harbour all the alleles.
                         get_shortest_path_per_contig is the most sophisticated and perhaps the slowest function of this script.
                         """
-                        if len(list(allele_dict.keys())) == cluster_size:
+                        if len(list(allele_dict.keys())) == cluster_size:  # Cases where not all alleles are found in a contig are skipped.
                             new_path = get_shortest_path_per_contig(contig_name = contig, alleles = allele_dict,\
                                                                     cluster_size = cluster_size, cid = cid,\
                                                                     sample = sample)
